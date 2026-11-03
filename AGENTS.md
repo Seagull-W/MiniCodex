@@ -93,7 +93,7 @@ MiniCodex/
 ## 6. 依赖基线
 
 `serde`, `serde_json`, `toml`, `clap`, `thiserror`, `anyhow`, `tracing`, `regex`, `shlex`,
-`tempfile`, `assert_cmd`, `insta`，以及 M7 起按需的 `tokio`。其余先问。
+`tempfile`, `assert_cmd`, `insta`, `uuid`（v7 特性，M1 起），以及 M7 起按需的 `tokio`。其余先问。
 
 ## 7. 什么时候停下交人
 

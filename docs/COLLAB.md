@@ -64,6 +64,9 @@ Hermes 是**复核者**，不是传声筒：Codex 的结论进仓库前，Hermes
   `crates.io` 直连可用；**`static.rust-lang.org` 不可达**，升级工具链要用清华镜像
   （`RUSTUP_DIST_SERVER=https://mirrors.tuna.tsinghua.edu.cn/rustup`），且必须
   `env -u http_proxy -u https_proxy -u all_proxy …`（本机 7897 代理是坏的，rustup 会去用它）。
+- 资料源分级：`deepwiki.com/openai/codex` 可用（`web_extract` 直接取，连续抓多页会 429），但它生成的页面
+  标注的是 `a97cf1b7` / `e75e4af2` 等**滑动 commit**，和锁定的 `f9e7b19` 不同 → 只能当 E2 地图用，
+  结论一律回源码核。它的价值是"告诉你有哪些 crate、大致谁调谁"，不是"告诉你某行是什么"。
 
 ### 3.2 派单命令
 
@@ -280,6 +283,9 @@ codex exec --sandbox danger-full-access --ephemeral -m gpt-6-astra \
 | MC-0002 | 2026-11-03 | M0 | 文档改版：约束瘦身 + 新增「怎么测试」教学 | — | PASS | §5；§12 |
 | MC-0003 | 2026-11-03 | M0 | 装 Rust 工具链并验证 serde 编译 | — | PASS | E0 见 §10 |
 | MC-0004 | 2026-11-03 | M0 | 骨架：workspace + 9 空 crate + x.sh + 工具链钉版本 | low | PASS | E0 见 §10 |
+| MC-0005 | 2026-11-03 | M1 | 解读 v1（一次性全量）→ 超范围中断，仅 3 条有效发现 | medium | FAIL | 见 §10 |
+| MC-0006 | 2026-11-03 | M1 | 解读 A：item 层（区间限定） | medium | PASS | E1 见 §10 |
+| MC-0007 | 2026-11-03 | M1 | 解读 B：Op/EventMsg 层（区间限定） | medium | PASS | E1 见 §10 |
 
 ### 条目模板
 
@@ -309,6 +315,8 @@ codex exec --sandbox danger-full-access --ephemeral -m gpt-6-astra \
 | R-005 | 策略引擎手写解析器，不用 starlark crate | 我们只需前缀规则子集，手写更可读 | ACTIVE |
 | R-006 | 约束只写"会真出问题"的，不写礼节性规则 | 规则越密越没人读；教学靠 §5，不靠禁令 | ACTIVE |
 | R-007 | `rust-toolchain.toml` 钉版本号（现为 `1.99.1`），不退化成 `stable` | 学习重写要比对行为，编译器漂移会制造假差异；钉版本的前提是把该版本 toolchain 真装出来 | ACTIVE |
+| R-008 | 依赖基线加入 `uuid`（`v7` 特性） | M1 要复刻 `Uuid::now_v7()` 与手写 serde；手搓 UUID 只会把学习预算花在编码细节上 | ACTIVE |
+| R-009 | 派单解读必须给**行号区间**，不给文件名 | MC-0005 证明：给文件名 = 让模型自己找边界，预算漏在探索上，收尾时交不出报告 | ACTIVE |
 
 ---
 
@@ -377,6 +385,35 @@ codex exec --sandbox danger-full-access --ephemeral -m gpt-6-astra \
   `1.99.1` 这个 toolchain；只有 `stable` 别名时，钉版本的表单会把所有人挡在门外。
 - 遗留：无（P1-1 关闭）
 
+#### MC-0005 · 2026-11-03 · M1 解读 v1（失败，但有料）
+- 目标：一次性解读 `ResponseItem` / `TurnItem` / `Op` / `EventMsg` / 三个 ID。
+- effort：medium
+- 结果：FAIL —— 读了 30 次命令、约 22 万字节事件流，进程结束时**没有交完整报告**（`-o` 文件事后才落地，
+  内容是半程汇报）。原因判断：单次范围过大，模型把预算花在探索上，收尾时超时/超上下文。
+- 仍然有效的发现（我已逐条复核）：
+  1. 上游**没有** `Op::UserTurn`，真正的输入变体是 `Op::TurnInput`（`protocol.rs:765`）——我 PLAN 里写的名字是错的；
+  2. `EventMsg::TurnStarted` 线格式是 `task_started`，`turn_started` 只是 alias（1585），`TurnComplete` 同理（1594）；
+  3. `RolloutId` 是 `ThreadId` 的别名，不是新类型（`thread_id.rs:23`）。
+- 学到：**派单要给行号区间，不给文件名。** 让模型"读这个文件"等于让它自己找边界，预算会漏在探索上。
+- 遗留：拆成 MC-0006/0007
+
+#### MC-0006 · 2026-11-03 · M1 解读 A（item 层）
+- 范围：`models.rs` 883–913、1069–1215、2364–2379；`items.rs` 47–75、85–293；三个 ID 文件
+- effort：medium（只读沙箱）
+- 结果：PASS，交 108 行六节报告，主动指出我 brief 里两处错误（`FunctionCallOutputPayload` 是 struct、
+  `FunctionCallOutputBody` 是 enum）并标出「指定区间不含 serde 属性，无法确认 tag」——没有假装知道。
+- 证据：E1 已复核——`ContentItem` 的 `tag="type", rename_all="snake_case"` 在 881–882；
+  `TurnItem` 只有 `tag="type"`、无 `rename_all`（`items.rs:47–51`）；payload 无 serde derive（2368）。
+- 学到：约束它"给不出处就进未确认项"之后，它不再编 API。
+
+#### MC-0007 · 2026-11-03 · M1 解读 B（Op/EventMsg 层）
+- 范围：`protocol.rs` 694–941、1528–1700、2329–2345、2407–2465、2781–2793、3870–3945；`turn_input.rs` 60–70
+- effort：medium（只读沙箱）
+- 结果：PASS，99 行。核心结论全部复核通过：`Op` 无 serde 且含 `oneshot::Sender`（702/768）；
+  六个事件 tag（含 `task_started`/`task_complete` 与 alias）；`ErrorEvent.misalignment` 双向 skip（2334–2337）；
+  `ExecCommandEndEvent` 的 `duration: Duration` 线格式为字符串（3941）。
+- 学到：**给结束行号**。它明确报告「区间止于 3930，结构未闭合，不能称完整清单」——这是我 brief 的错，它没有顺着补。
+
 #### MC-0002 · 2026-11-03 · 文档改版
 - 目标：用户指出原版过度防御、缺"怎么测试"。改为教学导向。
 - 改动：`AGENTS.md` 12 条铁律 → 7 条（每条带"为什么"），删掉"违反后果/回滚"判决语气与禁止清单；
@@ -407,3 +444,4 @@ codex exec --sandbox danger-full-access --ephemeral -m gpt-6-astra \
 |------|------|------|
 | 2026-11-03 | 建立本文件：E0–E3 分级、G1–G6 门禁、effort 预算、裁决 R-001–R-005 | 立项；把"Codex 文字不可作指导"落成流程 |
 | 2026-11-03 | 改版：约束瘦身；新增 §5 测试教学；验收改四步；加 R-006 | 过度防御偏离目标——这是给人学，不是给机器审 |
+| 2026-11-03 | 新增 `docs/PLAN.md`（整体规划）与 `docs/modules/M1-protocol.md`；裁决 R-008（uuid）、R-009（派单给行号区间） | 用户要求先定规划，Codex 只做解读，教学文档由 Hermes 复核产出 |
