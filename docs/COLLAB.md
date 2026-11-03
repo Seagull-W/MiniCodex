@@ -286,6 +286,8 @@ codex exec --sandbox danger-full-access --ephemeral -m gpt-6-astra \
 | MC-0005 | 2026-11-03 | M1 | 解读 v1（一次性全量）→ 超范围中断，仅 3 条有效发现 | medium | FAIL | 见 §10 |
 | MC-0006 | 2026-11-03 | M1 | 解读 A：item 层（区间限定） | medium | PASS | E1 见 §10 |
 | MC-0007 | 2026-11-03 | M1 | 解读 B：Op/EventMsg 层（区间限定） | medium | PASS | E1 见 §10 |
+| MC-0008 | 2026-11-03 | — | 架构拆解 + 课程改为 tracer bullet（R0–R8） | — | PASS | `ARCHITECTURE.md`；`PLAN.md` §2 |
+| MC-0009 | 2026-11-03 | — | 为 Codex 安装 3 个技能并验证可见 | low | PASS | E0 见 §10 |
 
 ### 条目模板
 
@@ -413,6 +415,23 @@ codex exec --sandbox danger-full-access --ephemeral -m gpt-6-astra \
   六个事件 tag（含 `task_started`/`task_complete` 与 alias）；`ErrorEvent.misalignment` 双向 skip（2334–2337）；
   `ExecCommandEndEvent` 的 `duration: Duration` 线格式为字符串（3941）。
 - 学到：**给结束行号**。它明确报告「区间止于 3930，结构未闭合，不能称完整清单」——这是我 brief 的错，它没有顺着补。
+
+#### MC-0008 · 2026-11-03 · 架构拆解与课程重排
+- 问题：上一版文档是"类型目录"，不是"逻辑拆解"。用户指出：没拆开 codex-cli 的核心逻辑，排布不合理。
+- 做法：读真实调用链（`exec/src/lib.rs:271` → `session/mod.rs:1072` → `handlers.rs:594` →
+  `tasks/regular.rs:48` → `session/turn.rs:178` 主循环 `:491` → `client.rs:2510` / `router.rs:367`），
+  写成 `docs/ARCHITECTURE.md`：7 个零件、12 步时序、6 个接缝、砍掉什么及为什么。
+- 课程从"按 crate 排"改为 tracer bullet `R0–R8`：R2 先跑假模型的单轮循环，再逐段加厚工具/补丁/上下文/持久化/真模型/前端。
+- 学到：**排布的依据是调用链，不是依赖图。** 依赖图告诉你"编译顺序"，调用链才告诉你"理解顺序"。
+- 遗留：`AGENTS.md` 里加一行指向 R 序的修改被审批拦住（保护文件），待用户批准。
+
+#### MC-0009 · 2026-11-03 · Codex 技能安装
+- 做法：`npx skills find` + skills.sh 搜索 → 选 3 个 → `npx skills add … -g -a codex --copy` →
+  安装器实际写到 `~/.agents/skills`（`-a codex` 没落盘，是它已知的静默跳过），再 `cp -r` 到
+  `/root/.codex/skills/` 与 `/mnt/c/Users/wenjx/.codex/skills/`。淘汰 `to-spec`（依赖 issue tracker，与本项目无关）。
+- 装上：`rust-best-practices`（94 行）、`rust-testing`（501 行）、`codebase-onboarding`（234 行）。
+- 证据：E0 —— `codex exec --skip-git-repo-check` 探针回答三行全 YES。
+- 学到：`-a codex` 的 "Done!" 不可信，必须落到 `$CODEX_HOME/skills` 再用探针验证。
 
 #### MC-0002 · 2026-11-03 · 文档改版
 - 目标：用户指出原版过度防御、缺"怎么测试"。改为教学导向。
