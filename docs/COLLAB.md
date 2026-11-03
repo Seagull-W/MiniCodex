@@ -59,7 +59,11 @@ Hermes 是**复核者**，不是传声筒：Codex 的结论进仓库前，Hermes
   锁定提交 `f9e7b19df8aa75490fc1d90f98d3d95ad716d08e`（2026-11-03）。
   不在这个提交上的行为不作依据；升级要立一条新裁决。
 - 已核实：`codex-cli 0.166.0`；`model = "gpt-6-astra"`；`config.toml` 里 `model_reasoning_effort = "low"`。
-- 本机 `rustc`/`cargo` 未安装（§11 P0-1），M0 卡在这里。
+- 本机工具链（2026-11-03 装好）：`rustc/cargo 1.99.1`、`clippy 0.1.99`、`rustfmt 1.10.0`，
+  装在 `/root/.cargo/bin`（已写入 `/root/.bashrc`、`/root/.profile`）。
+  `crates.io` 直连可用；**`static.rust-lang.org` 不可达**，升级工具链要用清华镜像
+  （`RUSTUP_DIST_SERVER=https://mirrors.tuna.tsinghua.edu.cn/rustup`），且必须
+  `env -u http_proxy -u https_proxy -u all_proxy …`（本机 7897 代理是坏的，rustup 会去用它）。
 
 ### 3.2 派单命令
 
@@ -274,6 +278,7 @@ codex exec --sandbox danger-full-access --ephemeral -m gpt-6-astra \
 | MC-0000 | 2026-11-03 | M0 | 建立协作文档 + `AGENTS.md`；锁定上游 f9e7b19 | — | PASS | 本文件；`git log` |
 | MC-0001 | 2026-11-03 | M0 | 冒烟：验证 `AGENTS.md` 真被注入、派单 flag 可用 | low | PASS | E0 见 §10 |
 | MC-0002 | 2026-11-03 | M0 | 文档改版：约束瘦身 + 新增「怎么测试」教学 | — | PASS | §5；§12 |
+| MC-0003 | 2026-11-03 | M0 | 装 Rust 工具链并验证 serde 编译 | — | PASS | E0 见 §10 |
 
 ### 条目模板
 
@@ -340,6 +345,19 @@ codex exec --sandbox danger-full-access --ephemeral -m gpt-6-astra \
 - 学到：`AGENTS.md` 注入链路有效，可作为长期约束入口；`--ephemeral` 不落会话文件，适合探针。
 - 遗留：无
 
+#### MC-0003 · 2026-11-03 · 工具链
+- 目标：装上 Rust 工具链，解锁 M0。
+- 过程：默认走 `static.rust-lang.org` 失败（本机不可达）→ 改用清华镜像直接取 `rustup-init`；
+  第一次仍超时，原因是 shell 里 7897 代理是坏的而 rustup 会读 `https_proxy` →
+  `env -u http_proxy -u https_proxy -u all_proxy` 后成功。
+- 结果：PASS
+- 证据：E0 —
+  `rustc 1.99.1 (58cf8f9c3 2026-10-13)` / `cargo 1.99.1` / `clippy 0.1.99` / `rustfmt 1.10.0-stable`；
+  `cargo new` 探针工程加 `serde`+`serde_json` 后 `cargo build` 退出码 0（`crates.io` 直连可用）。
+- 学到：这台机器"GitHub 能连、Rust 官方源不能连、crates.io 能连、7897 代理是死的"——
+  以后再遇到装不上，先看代理变量，再看镜像，不要以为是网络全断。
+- 遗留：无（P0-1 关闭）
+
 #### MC-0002 · 2026-11-03 · 文档改版
 - 目标：用户指出原版过度防御、缺"怎么测试"。改为教学导向。
 - 改动：`AGENTS.md` 12 条铁律 → 7 条（每条带"为什么"），删掉"违反后果/回滚"判决语气与禁止清单；
@@ -356,7 +374,7 @@ codex exec --sandbox danger-full-access --ephemeral -m gpt-6-astra \
 
 | 编号 | 事项 | 级别 | 备注 |
 |------|------|------|------|
-| P0-1 | 安装 Rust 工具链（`rustup` + stable，含 clippy/rustfmt） | 阻塞 M0 | 本机 `cargo`/`rustc` 均不存在 |
+| P0-1 | ~~安装 Rust 工具链~~ | 已完成 2026-11-03 | rustc/cargo 1.99.1 + clippy + rustfmt，见 MC-0003 |
 | P1-1 | 建 `x.sh`（fmt + clippy + test） | M0 | §6 第 2 步的唯一入口 |
 | P1-2 | 写 `docs/SPEC-M1.md`（mc-protocol 子集边界） | M1 前置 | 先定子集，否则必漂移 |
 | P2-1 | `mc-agent` 用 tokio 还是同步阻塞 | M7 前 | 影响依赖基线（R-004） |
