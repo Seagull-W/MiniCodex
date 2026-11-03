@@ -279,6 +279,7 @@ codex exec --sandbox danger-full-access --ephemeral -m gpt-6-astra \
 | MC-0001 | 2026-11-03 | M0 | 冒烟：验证 `AGENTS.md` 真被注入、派单 flag 可用 | low | PASS | E0 见 §10 |
 | MC-0002 | 2026-11-03 | M0 | 文档改版：约束瘦身 + 新增「怎么测试」教学 | — | PASS | §5；§12 |
 | MC-0003 | 2026-11-03 | M0 | 装 Rust 工具链并验证 serde 编译 | — | PASS | E0 见 §10 |
+| MC-0004 | 2026-11-03 | M0 | 骨架：workspace + 9 空 crate + x.sh + 工具链钉版本 | low | PASS | E0 见 §10 |
 
 ### 条目模板
 
@@ -307,6 +308,7 @@ codex exec --sandbox danger-full-access --ephemeral -m gpt-6-astra \
 | R-004 | 依赖基线限于 `AGENTS.md` §6 所列 | 一个依赖就是一片要读的代码 | ACTIVE |
 | R-005 | 策略引擎手写解析器，不用 starlark crate | 我们只需前缀规则子集，手写更可读 | ACTIVE |
 | R-006 | 约束只写"会真出问题"的，不写礼节性规则 | 规则越密越没人读；教学靠 §5，不靠禁令 | ACTIVE |
+| R-007 | `rust-toolchain.toml` 钉版本号（现为 `1.99.1`），不退化成 `stable` | 学习重写要比对行为，编译器漂移会制造假差异；钉版本的前提是把该版本 toolchain 真装出来 | ACTIVE |
 
 ---
 
@@ -358,6 +360,23 @@ codex exec --sandbox danger-full-access --ephemeral -m gpt-6-astra \
   以后再遇到装不上，先看代理变量，再看镜像，不要以为是网络全断。
 - 遗留：无（P0-1 关闭）
 
+#### MC-0004 · 2026-11-03 · M0 骨架
+- 目标：workspace + 9 个空 crate + `x.sh` + `rust-toolchain.toml`，不含业务逻辑。
+- effort：low（机械任务，符合 §4 预算）
+- 命令：`codex exec --sandbox danger-full-access -C /home/seagull/MiniCodex -m gpt-6-astra -c model_reasoning_effort=low --json -o .collab/out/MC-0004.md "$(cat .collab/briefs/MC-0004.md)"`
+- 结果：PASS（Codex 先 BLOCKED，Hermes 修环境后通过）
+- 证据：E0 —
+  - Codex 产出 21 个文件，`lib.rs` 只有一行 `//!` 说明，`x.sh` 可执行，`cargo tree` 只有 9 个本地 crate；
+  - `./x.sh` 退出码 0（fmt 干净 + clippy 无警告 + 9 个 crate 共 0 个测试全部 ok）；
+  - `cargo build --workspace --all-targets` 无警告；`cargo fmt --all --check` 干净；
+  - 全仓库无 `[dependencies]`，即零外部依赖。
+- 过程：Codex 按停止条件正确停下——`rust-toolchain.toml` 钉 `1.99.1`，但 rustup 只注册了 `stable`，
+  门禁报 `toolchain '1.99.1-…' is not installed`。它没有改 `x.sh` 的严格度，只交报告，这是对的行为。
+  修复发生在 Hermes 侧：装上版本化的 `1.99.1` 工具链，`x.sh` 随即全绿。
+- 学到：**「钉版本」的前提是那个版本真的装得出来**。`rustc --version` 显示 1.99.1 不等于有
+  `1.99.1` 这个 toolchain；只有 `stable` 别名时，钉版本的表单会把所有人挡在门外。
+- 遗留：无（P1-1 关闭）
+
 #### MC-0002 · 2026-11-03 · 文档改版
 - 目标：用户指出原版过度防御、缺"怎么测试"。改为教学导向。
 - 改动：`AGENTS.md` 12 条铁律 → 7 条（每条带"为什么"），删掉"违反后果/回滚"判决语气与禁止清单；
@@ -375,7 +394,7 @@ codex exec --sandbox danger-full-access --ephemeral -m gpt-6-astra \
 | 编号 | 事项 | 级别 | 备注 |
 |------|------|------|------|
 | P0-1 | ~~安装 Rust 工具链~~ | 已完成 2026-11-03 | rustc/cargo 1.99.1 + clippy + rustfmt，见 MC-0003 |
-| P1-1 | 建 `x.sh`（fmt + clippy + test） | M0 | §6 第 2 步的唯一入口 |
+| P1-1 | ~~建 `x.sh`（fmt + clippy + test）~~ | 已完成 2026-11-03 | 见 MC-0004；版本化 toolchain 1.99.1 已装 |
 | P1-2 | 写 `docs/SPEC-M1.md`（mc-protocol 子集边界） | M1 前置 | 先定子集，否则必漂移 |
 | P2-1 | `mc-agent` 用 tokio 还是同步阻塞 | M7 前 | 影响依赖基线（R-004） |
 | — | ~~`git init` + `.gitignore`~~ | 已完成 | 2026-11-03 |

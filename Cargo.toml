@@ -1,0 +1,17 @@
+[workspace]
+members = [
+    "crates/mc-protocol",
+    "crates/mc-config",
+    "crates/mc-agents-md",
+    "crates/mc-exec",
+    "crates/mc-policy",
+    "crates/mc-patch",
+    "crates/mc-rollout",
+    "crates/mc-agent",
+    "crates/mc-cli",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+publish = false
