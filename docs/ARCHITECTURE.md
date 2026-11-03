@@ -1,151 +1,224 @@
-# Codex CLI 核心逻辑拆解（我们这个项目的地图）
+# Codex CLI 全局架构
 
-> 目的：先看清**一次 turn 从按键到收尾**经过哪些零件、每个零件的边界在哪，再决定学什么、按什么顺序学。
-> 所有 `path:line` 都对着锁定的 `f9e7b19`。这份文档是"地图"，`docs/modules/M*.md` 是"每一段的路书"。
-
----
-
-## 1. 三层，七个零件
-
-Codex CLI 不是"一个 agent 类"，是**一条流水线**：前端把输入塞进队列 → 会话循环把输入变成一次 turn →
-turn 每轮向模型要事件、必要时调工具 → 事件同时被推给前端和落盘。
-
-| # | 零件 | 职责（一句话） | 上游主文件 | 我们的取舍 |
-|---|------|----------------|------------|-----------|
-| 1 | **前端** | 解析参数、选模式、把用户输入变成一次提交、打印事件 | `cli/src/main.rs` → `exec/src/lib.rs:271 run_main`、`861 run_exec_session` | 只做 exec 模式（`--json`/`-o`），不做 TUI/云/app-server |
-| 2 | **提交通道** | `Op` 进、`EventMsg` 出；一个线程一个队列 | `core/src/session/mod.rs:1072 submission_loop`、`1223 next_event`、`handlers.rs:594` | 做同步队列（无 tokio），只保留 `TurnInput`/`Interrupt` |
-| 3 | **任务与 turn 循环** | 决定"这一轮怎么跑"：记输入 → 可能要压缩 → 组 step → 采样 → 调工具 → 再来一轮 | `tasks/regular.rs:48 run` → `turn.rs:178 run_turn`（主循环 `:491`） | 做单轮 + 工具回环，砍 compaction/guardian/hooks |
-| 4 | **上下文与提示词** | 决定"发给模型什么"：历史 + 指令 + 工具清单 + 环境 | `core/src/context_manager/{mod,history,normalize}.rs`、`core/src/agents_md.rs` | 先做 history 拼接与 AGENTS.md 注入，砍归一化与 token 预算 |
-| 5 | **模型客户端** | 发请求、解析流、把每个 SSE 事件变成 `ResponseEvent` | `core/src/client.rs:2510 stream` | 先假模型（脚本化事件流），最后才接真 SSE |
-| 6 | **工具层** | 把模型给的 `FunctionCall` 变成受控执行，结果写成 `FunctionCallOutput` | `core/src/tools/router.rs:344 dispatch_tool_call_with_code_mode_result`、`:367`、`spec_plan.rs` | 先做 `shell` 一个工具，再加 `apply_patch`；砍 MCP/多代理/计划工具 |
-| 7 | **持久化** | 事件流追加成 JSONL，重启能接着聊 | `rollout/src/recorder.rs`（`~/.codex/sessions/YYYY/MM/DD`） | 做追加写 + 恢复；砍 SQLite 索引/压缩/搜索 |
-
-配置（`config`）不是零件，是**贯穿所有零件的参数板**：它决定用哪个模型、哪个沙箱、哪些工具可见。
-所以它不能太早学（没东西可配），也不能太晚（否则你以为行为是硬编码的）。
-
-### 砍掉的东西（以及为什么能砍）
-
-| 砍掉 | 上游位置 | 为什么可以砍 |
-|------|----------|--------------|
-| TUI / app-server / 云任务 | `tui`（39.9 万行）、`app-server` | 它们只是前端；核心逻辑一行都不在里面 |
-| MCP / 多代理 / 计划模式 | `codex-mcp`、`agent/` | 工具层的**扩展**，不是工具层本身 |
-| compaction / guardian / hooks | `turn.rs` 里 1457、1592、`guardian/` | 都是"围绕主循环"的旁路；主循环不依赖它们 |
-| 权限策略引擎全量 | `execpolicy`（3.1 k） | 我们只做前缀规则三态（M4） |
-| SQLite 线程库 | `state`、`thread-store` | JSONL 足够复现"恢复会话" |
-
-判断标准：**主循环能不能不依赖它跑完一轮？** 能 → 砍。
+> 对象：锁定的上游 `f9e7b19`（`/home/seagull/MiniCodex/codex-src`）。
+> 所有 `path:line` 都在该提交上核过。标注〔未验证〕的地方是我没读到实现、只从类型或调用点推断的。
+> 用法：**先读 §1 一张图，再读 §5 一次 turn，最后按 §10 的顺序读代码。** 不要从头顺读。
 
 ---
 
-## 2. 一轮 turn 的真实时序
+## 1. 一页图
 
 ```
-① 前端        exec::run_main → run_exec_session → start_thread           exec/src/lib.rs:271,861,1433
-② 提交        Session::submit(Op::TurnInput{..})                          session/mod.rs:1120 附近
-③ 分派        submission_loop 读队列 → handlers.rs:594 匹配 TurnInput     session/handlers.rs:594
-④ 起任务      RegularTask::run → run_turns（可多轮）                      tasks/regular.rs:48,129
-⑤ 记输入      run_hooks_and_record_inputs / record_conversation_items     turn.rs:447
-⑥ 预压缩      run_pre_sampling_compact（我们不做，留空）                  turn.rs:1457
-⑦ 组 step     捕获 step context：模型信息 + 工具路由 + 提示词             turn.rs:491 之前
-⑧ 采样        run_sampling_request → try_run_sampling_request             turn.rs:1792,2751
-  ⑧a 发请求    ModelClient::stream                                        client.rs:2510
-  ⑧b 收事件    ResponseEvent → ResponseItem → 事件/条目                    turn.rs:774
-⑨ 调工具      tool_router.dispatch_tool_call_with_state                   tools/router.rs:367
-  ⑨a 执行      shell / apply_patch 具体处理器
-  ⑨b 回写      FunctionCallOutput 记入历史，回到 ⑧ 再采样
-⑩ 收尾        无工具调用且模型给出终稿 → TurnComplete(turn_id,..)          protocol.rs:1594
-⑪ 落盘        每个事件/条目追加进 rollout JSONL                            rollout/src/recorder.rs
-⑫ 前端打印    --json 逐行输出；-o 写最终消息                               exec/src/lib.rs
+┌─ 层 1 前端 ────────────────────────────────────────────────────────────┐
+│ cli/src/main.rs:145  Subcommand::Exec ..                                │
+│   → exec/src/lib.rs:271 run_main → :861 run_exec_session → :1433 start  │
+│   → 自己的事件类型 exec/src/exec_events.rs:11 ThreadEvent               │
+│      （thread.started / turn.started / item.* / error，逐行 JSON）       │
+└───────────────┬────────────────────────────────────────────────────────┘
+                │ ① app-server JSON-RPC（ClientRequest / ServerNotification）
+┌───────────────▼─ 层 2 线程与协议 ──────────────────────────────────────┐
+│ app-server（7.0 万行）：把"开线程 / 发一轮 / 中断 / 审批" 变成 RPC       │
+│ core 侧：ThreadManager → CodexThread 持有 Session                      │
+└───────────────┬────────────────────────────────────────────────────────┘
+                │ ② core 内部提交协议：Op 进 / EventMsg 出
+┌───────────────▼─ 层 3 会话与 turn ─────────────────────────────────────┐
+│ Session::submit(Op)        session/mod.rs:1110                          │
+│   → submission_loop        session/mod.rs:1072                          │
+│   → handlers.rs:594 Op::TurnInput → 选 Task                             │
+│   → RegularTask::run       tasks/regular.rs:48                          │
+│   → run_turns（有排队输入就再跑一轮）tasks/regular.rs:129                │
+│   → run_turn               session/turn.rs:178                          │
+│        ├─ 记输入 / 预压缩 / 组 step（Prompt + 工具清单）                 │
+│        └─ loop { run_sampling_request → 工具派发 → needs_follow_up? }    │
+│   → ModelClient::stream    client.rs:2510                               │
+│   → tool_router.dispatch   tools/router.rs:367                          │
+└───────────────┬────────────────────────────────────────────────────────┘
+                │ ③ 模型线格式：ResponseItem 进请求、SSE ResponseEvent 回来
+┌───────────────▼─ 层 4 基础设施 ────────────────────────────────────────┐
+│ config（分层 TOML）· history/rollout（JSONL 事件溯源）· sandbox · auth   │
+└────────────────────────────────────────────────────────────────────────┘
 ```
 
-三个必须记住的事实：
-
-1. **`Op` 与 `EventMsg` 不是同一种消息**。`Op` 是进程内提交（带 `oneshot::Sender`，没有 serde，`protocol.rs:702/768`），
-   `EventMsg` 是可序列化事件（`tag="type"`，`protocol.rs:1531`）。前端只消费后者。
-2. **"一轮"其实是一个循环**（`turn.rs:491`）：采样 → 有工具调用就执行并回写 → 再采样，直到模型不再调工具。
-   所以 M7 不是"写一个请求函数"，是**写一个带终止条件的循环**。
-3. **事件有两条去向**：给前端看（`TurnItem`，PascalCase tag）和发给模型/落盘（`ResponseItem`，snake_case tag）。
-   同一件事有两种表示，是这行代码里最容易写错的地方（见 `docs/modules/M1-protocol.md` §6）。
+一句话：**同一个 turn 的信息被翻译了五次**（前端参数 → JSON-RPC → `Op` → `Prompt`/`ResponseItem` → SSE 事件 → `EventMsg` → `ThreadEvent`）。
+架构的复杂度不在算法，全在这些翻译的边界上。
 
 ---
 
-## 3. 六个"接缝"（学习优先级最高的地方）
+## 2. 四层，五个"语言"
 
-接缝 = 两个零件交换数据的那一行。**读懂接缝比读完整模块有用**，因为 bug 和理解偏差几乎都长在接缝上。
+| 层 | 职责 | 代码规模 | 我们是否复刻 |
+|----|------|----------|--------------|
+| 1 前端 | 参数、模式、把结果打印成可消费的流 | cli 3.0 万 + exec 0.66 万 + tui 39.9 万 | 只做 exec 形态 |
+| 2 线程/协议 | 多线程生命周期、对外 RPC（IDE/TUI/exec 共用） | app-server 7.0 万 + app-server-protocol 3.8 万 | **不做**，用直接函数调用替掉 |
+| 3 会话与 turn | 提交队列、任务选择、turn 循环、提示词、工具编排 | core 26.8 万 | 做最小闭环 |
+| 4 基础设施 | 配置、历史与落盘、沙箱、认证 | config 3.4 万 / rollout 1.9 万 / history 0.4 万 | 做配置、历史、落盘；沙箱只做策略判定 |
 
-| 接缝 | 交界处 | 要回答的问题 | 上游 |
-|------|--------|--------------|------|
-| S1 前端 → 会话 | `Op::TurnInput` | 用户输入怎么变成一次提交？中途插入怎么办？ | `handlers.rs:594` |
-| S2 会话 → 任务 | `RegularTask` 选择 | 什么输入走"普通轮"，什么输入走 review/compact？ | `tasks/mod.rs` |
-| S3 上下文 → 请求 | step context 组装 | 历史、指令、工具清单、环境各自从哪来、按什么顺序拼？ | `turn.rs:1763` 附近 |
-| S4 流 → 事件 | `ResponseEvent` 翻译 | 一个 delta 怎么变成 `agent_message`？终稿怎么判定？ | `turn.rs:774`、`protocol.rs:985` |
-| S5 工具调用 → 执行 | `router.dispatch` | 谁决定能不能并行？失败怎么变成 `FunctionCallOutput`？ | `router.rs:260,367` |
-| S6 事件 → 落盘 | recorder | 哪些事件落盘、哪些只给界面？恢复时怎么重放？ | `rollout/src/recorder.rs` |
+五种"语言"及其定义处：
 
----
+| 语言 | 定义 | 谁读 | 可序列化 |
+|------|------|------|----------|
+| app-server RPC | `app-server-protocol` 的 `ClientRequest` / `ServerNotification` | 前端 ↔ core | 是（JSON-RPC） |
+| 提交协议 | `Op`（`protocol.rs:702`） | 前端 → 会话循环 | **否**（含 `oneshot::Sender`） |
+| 事件协议 | `EventMsg`（`protocol.rs:1531`） | 会话循环 → 前端 / 落盘 | 是（`tag="type"`） |
+| 模型线格式 | `ResponseItem`（`models.rs:1069`） | core ↔ 模型 API | 是（`tag="type"`, snake_case） |
+| 展示条目 | `TurnItem`（`items.rs:47`） | 界面渲染 | 是（tag 是 PascalCase） |
 
-## 4. 新的学习顺序（tracer bullet：先跑通一条细线，再逐段加厚）
-
-旧顺序（M1 类型 → M2 配置 → M3 指令 → …）的问题是：**前十小时看不到任何会动的东西**，
-而且类型是先验的——你背下了 `ResponseItem`，但不知道它在第几步被谁构造。
-
-新顺序按"每完成一段就能看到一个可观察现象"排：
-
-| 段 | 做什么（能跑通的细线） | 依赖 | 你应当看到的现象 | 对应旧编号 |
-|----|------------------------|------|------------------|-----------|
-| **R0** | 骨架 + `x.sh`（已完成） | — | `./x.sh` 绿 | M0 |
-| **R1** | 最小类型子集：`TurnInput`、`EventMsg` 六个事件、`TurnItem` 四个条目、ID | — | 能把一段写死的 JSON 解成事件再编码回来 | M1（缩到 40%） |
-| **R2** | **假模型 + 单轮循环**：脚本给 3 个事件（started / 一条 agent_message / complete），跑完打印 | R1 | `mc-cli` 跑出一条完整 turn 的事件流 | M7 的骨架部分 |
-| **R3** | **工具回环**：加 `shell` 工具；模型说"要调工具"→ 执行 → 回写 → 再要一次 → 结束 | R2 | 看到 `exec_command_begin/end` 包住一次真实命令 | M4 的前半 |
-| **R4** | **写文件**：`apply_patch`，原子失败 | R3 | 上下文不匹配时文件不变、事件是 error | M5 |
-| **R5** | **上下文与指令**：配置分层 + AGENTS.md 注入 + prompt 组装顺序 | R2 | 改配置文件/加 AGENTS.md 后，请求内容跟着变 | M2+M3 |
-| **R6** | **持久化与恢复**：JSONL 追加、`resume` 重放 | R2 | 杀掉进程后能接着上一次的会话 | M6 |
-| **R7** | **真模型**：SSE 流解析、重试、usage | R2 | 同一个循环接真 API，事件流形状不变 | M7 剩余 |
-| **R8** | **前端收口**：`--json`/`-o`/退出码 | R7 | 可被脚本消费 | M8 |
-
-顺序理由（三条，都来自代码结构）：
-
-1. **R2 必须先于一切"实现细节"**：`run_turn` 的骨架（`turn.rs:178`）决定了后面每个模块被调用的位置。
-   先把骨架跑起来，类型和工具才有落脚点。
-2. **R3/R4 在 R5 之前**：工具执行的输入输出形状（`FunctionCallOutput`）会影响提示词与历史，
-   先做工具再学上下文，能亲眼看到"为什么历史里要存工具输出"。
-3. **R7 放最后**：真模型的 SSE 是最脏的一段（重试、断流、usage、加密内容），
-   放在假模型验证过循环之后，出错时你能分清是"循环错了"还是"解析错了"。
+落盘另有 `RolloutItem`（`history/src/lib.rs:220`：`SessionMeta` / `ResponseItem` / `DynamicToolsUpdated` …）——它是**事件的持久化投影**，不是新语义。
 
 ---
 
-## 5. 每段的可观察验收（不是"测试通过"，是"看到现象"）
+## 3. 层 1：exec 前端做了什么（比想象的少）
 
-| 段 | 验收要看到 |
-|----|-----------|
-| R1 | 一段手写 JSON → `EventMsg` → 编码回 JSON，`type` 是 `task_started`（不是 `turn_started`） |
-| R2 | 终端依次出现：`task_started` → `agent_message` → `task_complete`，且 `turn_id` 一致 |
-| R3 | 中间多出 `exec_command_begin{cwd,command}` / `exec_command_end{exit_code,aggregated_output}`，`call_id` 配对 |
-| R4 | 故意给错上下文 → 文件内容不变、有 error 事件；给对 → 文件变了、`exit_code=0` |
-| R5 | 往项目根加一行 `AGENTS.md`，请求体里出现对应的指令块；换 profile，模型名跟着变 |
-| R6 | `Ctrl-C` 后再跑 `resume`，历史条数与上次相同、能继续提问 |
-| R7 | 同一个二进制，把假模型换成真客户端，事件序列形状不变（只多了 usage/delta） |
-| R8 | `mc-cli --json > out.jsonl` 每行都是合法 JSON；错命令退出码非 0 |
+`run_main`（`exec/src/lib.rs:271`）只做四件事：读配置 → 建 in-process app-server 客户端 → 起线程 → 循环消费事件。
+它自己**不碰 core 的类型**，只认 `ClientRequest` 和 `ThreadEvent`：
+
+- `InProcessAppServerClient`（`exec/src/lib.rs:22`）——同一个进程内的 JSON-RPC 客户端；
+- `ThreadEvent`（`exec/src/exec_events.rs:11`）——`--json` 每行输出的那个结构，`serde(rename = "thread.started")` 这类重命名就写在这里；
+- 最终消息另存（`-o`），由 `event_processor_with_jsonl_output.rs:84` 的 state 收集。
+
+要点：**前端是协议的消费者，不是逻辑的拥有者。** 所以我们复刻时可以把层 2 整个砍掉，
+让 `mc-cli` 直接调 `mc-agent`，只保留"逐行输出 `ThreadEvent`"这个形态。
+
+## 4. 层 2：为什么 core 外面还套一层 RPC
+
+因为 TUI、exec、IDE 三种前端要共享同一套会话能力，而 TUI 需要**在 turn 进行中插话/审批**。
+`app-server` 把"开线程、提交一轮、中断、答复审批"做成请求-响应 + 通知流，core 只暴露 `Session::submit` 与 `next_event`（`session/mod.rs:1110`、`:1223`）。
+
+我们不做这一层，但**必须保留它的两个语义**，否则 R2 之后会返工：
+1. 提交是**排队**的，不是直接调用（`Op` 进队列，由会话循环串行消费）；
+2. 事件是**流**，前端边收边渲染（`next_event` 一直可等）。
+
+## 5. 层 3：一次 turn 的完整生命周期（本文主体）
+
+### 5.1 外层：一个任务可以跑多轮 turn
+
+`run_turns`（`tasks/regular.rs:129`）是一个循环：跑完一轮，如果 `input_queue` 里还有待处理输入（用户在 turn 中途又发了话），
+就把 `next_input` 清空再跑一轮，直到没有排队输入（`:150–160`）。这就是"steering"（中途插话）的实现位置。
+
+### 5.2 内层：run_turn 的十步
+
+| # | 步骤 | 位置 | 数据变化 |
+|---|------|------|----------|
+| 1 | 记输入 | `turn.rs:447 record_conversation_items` | `TurnInput` → `ResponseItem` 进历史 |
+| 2 | 预压缩 | `turn.rs:1457 run_pre_sampling_compact` | 历史可能被摘要替换（我们不做） |
+| 3 | 解析 MCP/工具需求 | `turn.rs:~300` | 决定本轮可见工具集（我们固定） |
+| 4 | 组 step context | `turn.rs:491` 之前 | 得到 `StepContext`：模型信息 + `tool_router` + 提示词快照〔未验证字段全貌〕 |
+| 5 | 取历史快照 | `turn.rs:590 clone_history` | `Vec<ResponseItem>` |
+| 6 | 组装请求 | `turn.rs:1751 build_prompt` → `Prompt { input, tools, parallel_tool_calls: true, base_instructions, output_schema }` | 历史 + 工具 JSON Schema + 系统指令 |
+| 7 | 采样 | `turn.rs:1792 run_sampling_request` → `:2751 try_run_sampling_request` → `client.rs:2510 stream` | 请求 → SSE `ResponseEvent` 流 |
+| 8 | 流事件落成条目 | `turn.rs:774 record_response_item_and_emit_turn_item` | 每个 `ResponseItem` → ①进历史 ②转 `TurnItem` 发事件 |
+| 9 | 工具派发 | `router.rs:271 build_tool_call` → `:367 dispatch_tool_call_with_state`；并行由 `:260 tool_supports_parallel` 决定，`turn.rs:3159 in_flight.push_back` | `FunctionCall` → 执行 → `FunctionCallOutput` 进历史 |
+| 10 | 判定是否再来一轮 | `turn.rs:637`：`needs_follow_up = model_needs_follow_up \|\| has_pending_input` | true → 回到 6；false → 收尾发 `task_complete` |
+
+### 5.3 终止条件（一个公式 + 两个意外）
+
+`turn.rs:637` 把"继续"写成了一个或运算：
+
+```
+needs_follow_up = 模型还要工具（model_needs_follow_up） || 队列里还有输入（has_pending_input）
+```
+
+所以停下来的条件只有一个：**模型不再要工具，且队列空了**。由此派生三种真实情形：
+
+1. 正常收尾：模型给出终稿，队列空 → `task_complete`；
+2. 中途插话：模型不再要工具，但用户又发了话 → 同一 turn 里继续（steering，`run_turns` 也会再跑一轮，`regular.rs:150`）；
+3. 取消：`CancellationToken` 沿每层传播，中断后走 `TurnAborted` 路径而不是 `task_complete`〔未验证该路径的具体事件与顺序〕。
+
+### 5.4 请求里到底有什么
+
+`build_prompt`（`turn.rs:1751`）给出的 `Prompt` 字段就是"模型看到的一切"：
+
+| 字段 | 来源 | 说明 |
+|------|------|------|
+| `input` | 会话历史快照 | `Vec<ResponseItem>`，含历史工具输出 |
+| `tools` | `tool_router.model_visible_specs()` | 工具的 JSON Schema 清单，**由注册表生成**，不是写死的 |
+| `parallel_tool_calls` | 常量 `true` | 是否允许模型一次给多个调用 |
+| `base_instructions` | 配置 + 仓库指令（AGENTS.md） | 系统提示词主体 |
+| `output_schema` | turn 配置 | 结构化输出时才有 |
+
+**没有"消息字符串"这一层**：发给模型的不是一段文本，而是 `input` 数组 + `tools` 数组。这是最容易带着"聊天应用"直觉写错的地方。
+
+## 6. 层 4：三块基础设施
+
+| 设施 | 职责 | 关键位置 | 我们复刻到什么程度 |
+|------|------|----------|--------------------|
+| config | 分层合并：默认 → 用户 → 项目 → profile → CLI | `config/src/loader/mod.rs`、`types.rs` | 五层深合并 + 未知键报错（R5） |
+| history / rollout | 历史是内存里的 `Vec<ResponseItem>`；落盘是 JSONL 追加 `RolloutItem` | `history/src/lib.rs:220`、`rollout/src/recorder.rs` | 追加写 + 读回重放（R6） |
+| sandbox / 审批 | 决定命令能不能跑、要不要问人 | `execpolicy/`、`sandboxing/` | 只做前缀规则三态（R3 的旁支） |
+
+认证（`login/`）与云端（`cloud-*`）不碰：本地 CLI 用已有凭据即可。
 
 ---
 
-## 6. 每个零件"学到什么算懂"（对应旧文档）
+## 7. 为什么这么分层（六条设计约束，都有代码证据）
 
-| 零件 | 懂的标志 |
-|------|----------|
-| 前端 | 能说出 `--json` 的每一行是谁产生的、为什么不是一次性输出 |
-| 提交通道 | 能解释为什么 `Op` 不能序列化，而 `EventMsg` 可以 |
-| turn 循环 | 能画出"采样 → 工具 → 再采样"的循环图，并说出三种终止条件 |
-| 上下文 | 能列出请求体的组成部分与拼接顺序，指出哪部分来自配置、哪部分来自仓库 |
-| 模型客户端 | 能说出一个 SSE delta 到 `agent_message` 的完整变换链 |
-| 工具层 | 能解释并行工具的安全边界，以及失败如何回写成结果 |
-| 持久化 | 能解释"哪些事件进 JSONL"以及恢复时如何避免重复执行工具 |
+1. **提交串行、事件流式**：每个会话一个 `submission_loop`（`session/mod.rs:1072`），保证历史只有一个写者；
+   前端只能通过 `next_event`（`:1223`）观察。→ 复刻时别用"回调里直接改历史"，会出现两份真相。
+2. **`Op` 不可序列化是刻意的**：它带 `oneshot::Sender`（`protocol.rs:768`），是进程内命令，不是消息。
+   能落盘的只有 `EventMsg` 与 `ResponseItem`。→ 我们的 `Op` 保持"无 serde"，别为了测试方便给它 derive。
+3. **工具是注册表，不是 if-else**：请求里的 `tools` 由路由表生成（`turn.rs:1763`），
+   并行与否也由注册表声明（`router.rs:260`）。→ 加工具 = 注册一条，不动主循环。
+4. **工具结果就是一条 `ResponseItem`**：`FunctionCallOutput` 进历史（`models.rs:1190`），
+   下一轮采样自然带上。→ 所以"工具输出要不要发给模型"不是策略问题，是数据结构问题。
+5. **落盘是事件溯源**：`RolloutItem` 记录的是"发生过什么"（`history/src/lib.rs:220`），不是"当前状态"。
+   恢复 = 重放，不是读快照。→ 这也是为什么坏行可以跳过。
+6. **两套事件表示（`ResponseItem` / `TurnItem`）是分工，不是冗余**：前者给模型和磁盘，后者给界面。
+   tag 规则不同（snake_case vs PascalCase），由 serde 属性决定，与变体名无关。
 
----
+## 8. 并发与取消（三条规则）
 
-## 7. 这份拆解纠正的三个误解
+1. **一个会话同时只有一个活动 turn**：新输入进 `input_queue`，由当前 turn 消费（`run_turns` 的循环条件）。
+2. **工具可以并行，但必须是注册表声明过的**：`tool_supports_parallel`（`router.rs:260`）为假就串行；
+   并行结果用 `FuturesOrdered` 保序回写（`turn.rs:3159`）。
+3. **取消沿 token 传播**：`run_turn` 每一层都收 `CancellationToken`，中断不会杀死后台进程，只结束这一轮。
 
-1. **"先学类型，再学逻辑"** → 类型是被循环塑造的。先有骨架（R2），类型的字段才有意义。
-2. **"一个 turn = 一次请求"** → `turn.rs:491` 是循环：请求→工具→再请求，直到模型不再要工具。
-3. **"事件是给人看的"** → 事件同时供前端显示（`TurnItem`）和发给模型/落盘（`ResponseItem`），
-   两种表示 tag 规则不同（PascalCase vs snake_case），这是最容易静默写错的一处。
+## 9. 我们要复刻的最小闭环
+
+`R0–R8` 的顺序与验收见 `docs/PLAN.md` §2。这里只强调它与架构的对应：
+
+```
+R1 语言(§2 表格第 3、5 行) → R2 层3 的 5.2 十步骨架 → R3 第 9 步 → R4 第 9 步的第二种工具
+→ R5 第 4/6 步的输入来源 → R6 第 8 步的落盘 → R7 第 7 步换真实现 → R8 层 1 的输出形态
+```
+
+也就是：**先造 §5.2 那条流水线，再逐段把假件换成真件。** 层 2 整个不要，层 4 只保留配置与落盘。
+
+## 10. 读代码路线（按这个顺序，别乱翻）
+
+| # | 读什么 | 行数 | 读的目的 |
+|---|--------|------|----------|
+| 1 | `exec/src/lib.rs:271-300, 861-930, 1433-1470` | ~120 | 前端只做协议消费，理解 `--json` 的由来 |
+| 2 | `core/src/session/mod.rs:1072-1135, 1223-1235` | ~70 | 提交与事件两条通道 |
+| 3 | `core/src/session/handlers.rs:500-600` | ~100 | `Op` 如何被分派成任务 |
+| 4 | `core/src/tasks/regular.rs:48-165` | ~117 | starts/turns 两层循环与 steering |
+| 5 | `core/src/session/turn.rs:178-260`（入口）、`430-520`（组 step）、`590-660`（采样结果）| ~200 | 主流程骨架 |
+| 6 | `core/src/session/turn.rs:1751-1800`、`2751-2830` | ~130 | 请求怎么组装、流怎么进来 |
+| 7 | `core/src/tools/router.rs:250-300, 340-400` | ~100 | 工具注册表与派发 |
+| 8 | `history/src/lib.rs:220-260`、`rollout/src/recorder.rs`（挑 100 行） | ~150 | 落盘记录的种类与写入时机 |
+
+合计约 1000 行，是理解整个 codex 的最小阅读量（对比 core 的 26.8 万行）。
+其余（compaction、guardian、hooks、MCP、多代理）都是在这条主线上挂的旁路。
+
+## 11. 术语表
+
+| 词 | 含义 | 别混 |
+|----|------|------|
+| thread | 一条持久会话（有 `ThreadId`），可多次 turn | ≠ `turn` |
+| session | 运行中的线程实例（`Session`，持有队列与历史） | 1 thread 在内存里对应 1 session |
+| submission | 一次 `Op` 入队 | 一次 `Op::TurnInput` 会开启一个 turn |
+| task | 驱动一个 turn 的执行体（Regular/Review/Compact…） | task 完成 ≠ turn 完成（turn 可续跑） |
+| turn | 用户一次提问引发的处理单元，含多次采样 | 不是"一次请求" |
+| step | turn 内的一次"组请求 + 采样" | 工具调用后进入下一 step |
+| rollout | 落盘的事件流（JSONL） | 不是聊天记录，是事件溯源日志 |
+| compaction | 历史超阈值时的摘要替换 | 会改历史，不改事件流 |
+
+## 12. 未验证项（下一轮读代码要补）
+
+1. `StepContext` 的完整字段与它捕获的时机（`core/src/session/step_context.rs`）；
+2. `Op::TurnInput` 到 `RegularTask` 的选择逻辑（`tasks/mod.rs`，什么输入走 review/compact）；
+3. `input_queue` 的具体语义：中途插话是"合并进当前轮"还是"开新轮"；
+4. app-server 的 `ServerNotification` 到 exec `ThreadEvent` 的完整映射表；
+5. 恢复会话时如何避免重复执行已落盘的工具调用（幂等边界在哪）；
+6. 中断路径发出的事件名与顺序。
+
+这六条读清之后再更新本文件，并把对应的行号补进 §5.2 的表。
