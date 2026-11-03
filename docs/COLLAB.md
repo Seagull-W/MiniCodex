@@ -184,6 +184,7 @@ Codex 的最终消息（`-o` 文件）只是**待审材料**。Hermes 按这张�
 | 任务 | 日期 | 里程碑 | 摘要 | effort | 状态 | 证据 |
 |------|------|--------|------|--------|------|------|
 | MC-0000 | 2026-11-03 | M0 | 建立协作文档 + `AGENTS.md`；锁定上游 f9e7b19 | — | PASS | 本文件；`git log` |
+| MC-0001 | 2026-11-03 | M0 | 冒烟：验证 `AGENTS.md` 真被注入、派单 flag 可用 | low | PASS | E0 见 §10 明细 |
 
 ### 条目模板（新任务追加到上表下方「明细」）
 
@@ -239,6 +240,18 @@ Codex 的最终消息（`-o` 文件）只是**待审材料**。Hermes 按这张�
 ### 任务明细
 
 （从 MC-0001 开始追加）
+
+#### MC-0001 · 2026-11-03 · M0 冒烟验证
+- 目标：确认 `AGENTS.md` 在 `codex exec` 下被真实注入，且本文 §3.2 的 flag 组合可用。
+- effort：low
+- 命令：`codex exec --sandbox read-only --ephemeral -C /home/seagull/MiniCodex -m gpt-6-astra -c model_reasoning_effort=low --json -o .collab/out/smoke.md "只读任务：…引用 R1/R9…"`
+- 结果：PASS（exit 0）
+- 证据：E0 — 模型逐字引用了 `AGENTS.md` 的 R1、R9 表格行，并正确报出 M2 的 `800–1200` 行与三个上游锚点路径；
+  原始事件流在 `.collab/raw/smoke.jsonl`（不入库）。
+- 结论：① `AGENTS.md` 注入链路有效，本文档可作为长期约束入口；② `-c model_reasoning_effort=low`
+  覆盖生效（本机 `config.toml` 默认也是 low，覆盖写法仍需保留以支持升档）；③ `--ephemeral` 不落会话文件，
+  适合探针任务。
+- 遗留：无
 
 ---
 
