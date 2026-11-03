@@ -1,200 +1,182 @@
-# M1 mc-protocol
+# 第一步：给会话一套语言
 
-> 依据：上游 `f9e7b19` 的 `codex-rs/protocol`。本文所有结论都在源码里核过，行号可直接跳。
-> 解读草稿来自 Codex 的三份报告（MC-0005/0006/0007），**只保留了我在源码复核通过的部分**；
-> 它报错的、含糊的、以及"通常来说"的部分全部删掉了。
+这一块叫 `mc-protocol`，五个文件、大约七百行。它是整条链路里最小的模块之一，但要最早写——
+因为后面每一个部件都在说它的方言：循环要 match 事件、请求要装 item、落盘要序列化。
+先把语言定下来，后面的代码才不会一边写一边改字段。
 
-## 0. 一句话 + 位置
+写完之后你应该能做到：拿一段手写的 JSON，解析成事件、再编码回去，得到和上游一样的字符串。
+这件事听起来琐碎，但它检验的是你对"三种语言分工"的理解——而不是记忆力。
 
-协议层 = 会话里流通的**三种语言**：发给模型的线格式（`ResponseItem`）、给人看的条目（`TurnItem`）、
-进程内外传的消息（`Op` 进 / `EventMsg` 出）。它不依赖任何模块，M2–M8 全部依赖它。
+## 一、这块在链路的哪里
+
+codex 内部同时流通三种东西，长得像但用途完全不同。
+
+发给模型的是 `ResponseItem`：一条消息、一次推理、一个工具调用、一次工具输出。它是请求体里的数组元素。
+给界面看的是 `TurnItem`：同一件事的展示形态，带稳定的 id，方便前端增量更新。
+在进程内传递的是 `Op` 和 `EventMsg`：前者从外面进来，后者往外走。
+
+用户打一句话，三种东西会在一秒内全部出现：
 
 ```
-Op ──→ [会话循环] ──→ EventMsg ──→ 前端 / rollout
-              │
-              ├──→ ResponseItem ──→ 模型 API（发出去 / 收回来）
-              └──→ TurnItem ─────→ 界面显示
+你输入 "修一下 README"
+   → Op::TurnInput            （进队列）
+   → ResponseItem::Message    （作为 user 消息进历史，随请求发给模型）
+   → EventMsg::TurnStarted    （告诉界面：开始干活了）
+   → TurnItem::UserMessage    （界面上出现你那条消息的卡片）
 ```
 
-## 1. 上游在哪（只读这些）
+看懂这条链，就知道为什么后面写循环时，"记历史"和"发事件"总是成对出现——
+它们不是同一件事，只是一起发生。
 
-| 文件 | 行数 | 读它为了什么 |
-|------|------|--------------|
-| `protocol/src/session_id.rs`、`thread_id.rs`、`response_item_id.rs` | 各 <120 | 三种 ID：两种 UUID、一种宽松字符串。看它们怎么手写 serde |
-| `protocol/src/models.rs` 883–913、1069–1341、2368–2379 | — | `ContentItem`、`ResponseItem`、工具输出 payload |
-| `protocol/src/items.rs` 47–75、85–293 | — | `TurnItem` 与四个条目结构 |
-| `protocol/src/protocol.rs` 694–941、1528–1700、2329–2345、2407–2465、2781–2793、3870–3945 | — | `Op`、`EventMsg` 与六个事件结构 |
-| `protocol/src/turn_input.rs` | — | `TurnInputRequest`（`Op::TurnInput` 的载荷） |
+## 二、上游在哪，怎么读
 
-`protocol/src/protocol.rs` 有 6803 行：**按行号区间读**，别通读。
+上游 `codex-rs/protocol` 有三万四千行、七十多个模块，绝大部分与我们无关。要读的只有六段，总共约六百行：
 
-## 2. 数据结构
+先看三个 ID 的小文件（`session_id.rs`、`thread_id.rs`、`response_item_id.rs`，每个不到一百二十行）。
+它们示范了如何给一个 newtype 手写 serde，是本模块唯一需要动脑的地方。
 
-### 2.1 三种 ID（`ids.rs`）
+再看 `models.rs` 的三段：`ContentItem`（882–913）、`ResponseItem`（1069–1341）、工具输出 payload（2364–2379）。
 
-| 类型 | 内部表示 | 序列化成什么 | 反序列化行为 | 出处 |
-|------|----------|--------------|--------------|------|
-| `SessionId` | `Uuid` | 字符串（手写 `Serialize`） | 先要字符串，再 `Uuid::parse_str`，失败 → serde 自定义错误 | `session_id.rs:79–96` |
-| `ThreadId` | `Uuid` | 同上 | 同上 | `thread_id.rs:11–18` |
-| `RolloutId` | **是 `ThreadId` 的别名**，不是新类型 | — | — | `thread_id.rs:23` |
-| `ResponseItemId` | `String`（`#[serde(transparent)]`） | 裸字符串 | **不校验**：空串、`"x"`、数字以外的任何字符串都收 | `response_item_id.rs:11–17` |
+然后 `items.rs` 的 47–293 行，`TurnItem` 与四个条目结构都在里面。
 
-要点：`ThreadId` 与 `SessionId` 是同一个 UUID 的两种角色，可以互转且不重新生成（`session_id.rs:55–64`）。
-`ResponseItemId` 是"宽松接收、严格生产"——`new("msg")` 生成 `msg_<uuidv7>`，但读旧数据时不管格式。
+最后 `protocol.rs`，它有 6803 行，只看四段：`Op`（694–941）、`EventMsg`（1528–1700）、
+以及 `ErrorEvent`（2329–2345）、`TurnCompleteEvent` / `TurnStartedEvent`（2407–2465）、
+`AgentMessageEvent`（2781–2793）、两个 exec 事件（3870–3945）。**按区间读，别通读。**
 
-### 2.2 `ContentItem`（`models.rs:882–913`）
+## 三、三个 ID：手写 serde 的三个理由
 
-```rust
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ContentItem {
-    InputText  { text: String },                 // {"type":"input_text","text":...}
-    OutputText { text: String,                   // {"type":"output_text",...}
-                 annotations: Option<Vec<Value>>, logprobs: Option<Vec<Value>> },
-    // 上游还有 InputImage / InputAudio —— 本课程不做
-}
-```
+`SessionId` 里面是一个 `Uuid`，但它在 JSON 里是一个裸字符串。所以上游没有 derive，
+而是手写 `Serialize`（`collect_str`）和 `Deserialize`（先取字符串，再 `Uuid::parse_str`，失败时用
+`serde::de::Error::custom` 报错，`session_id.rs:79-96`）。手写的好处是错误信息能带上原始输入。
 
-### 2.3 `ResponseItem`（`models.rs:1069–1341`）——发给模型的线格式
+`ThreadId` 一模一样，但语义不同：它标识"一条会话"，`SessionId` 标识"一次运行"。
+两者可以互转，转换时不重新生成 UUID（`session_id.rs:55-64`）——这条容易写错成"转一次生成一个新 id"。
 
-`#[serde(tag = "type", rename_all = "snake_case")]`，末尾还有 `#[serde(other)] Other`（1339–1340）。
+`RolloutId` 不是第四个类型，只是 `type RolloutId = ThreadId`（`thread_id.rs:23`）。
+这是一个可以学的取舍：新类型能防串用，别名省掉一次转换；上游在这里选了后者。
 
-| 变体 | 我们保留的字段 | 说明 |
-|------|----------------|------|
-| `Message` | `id?`, `role: String`, `content: Vec<ContentItem>`, `phase?` | 上游还有 `encrypted_content`/`status`/metadata，全部 Option，本课程不移植 |
-| `Reasoning` | `id?`, `summary: Vec<_>`, `content?: Option<Vec<_>>` | `content` 上有 `skip_serializing_if = "should_serialize_reasoning_content"`（1121），即**默认不发** |
-| `FunctionCall` | `id?`, `name: String`, `arguments: String`, `call_id: String`, `namespace?` | `arguments` 是**字符串化的 JSON**，不是对象（1155 注释里写明） |
-| `FunctionCallOutput` | `id?`, `call_id?: Option<String>`, `output: FunctionCallOutputPayload` | `call_id` 在上游居然是可选的（1195） |
-| `Other` | — | 未知 tag 落到这里而不是报错（1339） |
+`ResponseItemId` 反过来，是"宽松接收、严格生产"：内部是裸 `String`，带 `#[serde(transparent)]`
+（`response_item_id.rs:11-17`）。`new("msg")` 会生成 `msg_<uuidv7>`，但反序列化时不管格式，
+空串、`"x"` 都收。原因是它要读历史数据，而历史里什么都可能有。
 
-### 2.4 工具输出 payload（`models.rs:2364–2379`）
+## 四、发给模型的 item
 
-```rust
-/// `body` 直接作为 wire 上 function_call_output.output 的值；
-/// `success` 只是内部元数据。
-pub struct FunctionCallOutputPayload { pub body: FunctionCallOutputBody, pub success: Option<bool> }
+`ResponseItem` 顶部是 `#[serde(tag = "type", rename_all = "snake_case")]`，所以线上是
+`{"type":"message"}` 这种形状（`models.rs:1069-1070`）。我们只做五种变体。
 
-#[serde(untagged)]
-pub enum FunctionCallOutputBody { Text(String), ContentItems(Vec<...>) }
-```
+`Message` 装一个 `role` 和一个 `ContentItem` 数组。`ContentItem` 自己也带同样的 tag 和
+`rename_all`（882–883），所以是 `input_text` / `output_text`。上游还有图片和音频，我们不做。
 
-关键：**这个结构体没有 derive Serialize/Deserialize**（2368 的 derive 列表里只有 Debug/Default/Clone/PartialEq/JsonSchema/TS）。
-线上只有 `body`；`success` 不进 JSON。这是"内存结构 ≠ 线格式"的唯一样例，值得单独写测试。
+`Reasoning` 有个细节：`content` 字段的序列化条件是 `should_serialize_reasoning_content`（1121），
+意思是"推理正文默认不发出去，只发摘要"。这个函数体我们没读，但行为可以先用测试锁死：
+`content` 是 `None` 时序列化结果里没有这个键。
 
-### 2.5 `TurnItem`（`items.rs:47–75`）——给人看的条目
+`FunctionCall` 里最容易写错的是 `arguments`——它是**字符串化的 JSON**，不是对象（1155 附近的注释写明）。
+模型返回的就是一段文本，我们不做解析。
 
-```rust
-#[serde(tag = "type")]          // 注意：没有 rename_all
-pub enum TurnItem { UserMessage(..), AgentMessage(..), Reasoning(..), CommandExecution(..), ... }
-```
+`FunctionCallOutput` 的 `output` 字段是 `FunctionCallOutputPayload`（2364–2379），这里藏着本模块唯一的
+"内存结构 ≠ 线格式"：那个结构体**没有 derive Serialize/Deserialize**，注释说得很直接——
+`body` 直接作为线上的值，`success` 只是内部元数据。也就是说，编码时只写 `body`，
+解码时 `success` 永远是 `None`。这解释了为什么它需要手写，也解释了为什么我们单独给它写两条测试。
 
-**tag 就是 Rust 变体名**：`{"type":"UserMessage"}`，不是 `user_message`。这条与 `ResponseItem` 的 snake_case 完全相反，
-是这一课最容易被"顺手统一"掉的差异。
+最后是 `Other`：`ResponseItem` 末尾有 `#[serde(other)] Other`（1339–1340）。
+未知的 `type` 不会报错，而是落进这个变体。这是"读旧数据"的策略，不是疏忽。
 
-| 结构 | 我们保留的字段 | 出处 |
-|------|----------------|------|
-| `UserMessageItem` | `id: String`, `client_id?`, `content: Vec<UserInput>` | `items.rs:85–91` |
-| `AgentMessageItem` | `id`, `content: Vec<AgentMessageContent>`, `phase?` | `items.rs:160–179` |
-| `ReasoningItem` | `id`, `summary_text: Vec<String>`, `raw_content: Vec<String>`（`#[serde(default)]`） | `items.rs:200–206` |
-| `CommandExecutionItem` | `id`, `command: Vec<String>`, `cwd: PathUri`, `status: CommandExecutionStatus`, `aggregated_output?`, `exit_code?`, `duration?` | `items.rs:253–289` |
+## 五、给界面看的条目，为什么是另一套
 
-`CommandExecutionStatus` = `in_progress | completed | failed | declined`（`items.rs:208–214`，snake_case）。
+`TurnItem` 的第一行就有陷阱：它只有 `#[serde(tag = "type")]`，**没有 `rename_all`**
+（`items.rs:47-51`）。所以 tag 是 Rust 变体名本身，`{"type":"UserMessage"}`，不是 `user_message`。
 
-### 2.6 `Op` / `EventMsg`（`protocol.rs:694–941`、`1528–1700`）
+同一份数据，给模型的那套转成 snake_case，给界面的这套保持 PascalCase。这不是历史遗留的懒，
+而是因为 `TurnItem` 是界面契约：前端按这些字符串做增量渲染，改名等于破坏兼容。
 
-- **`Op` 没有 serde derive**（702：只有 `derive_more::Debug` + `#[non_exhaustive]`），因为它带
-  `reply: oneshot::Sender<CodexResult<TurnInputSubmission>>`（768）——进程内通道，不可能落盘。
-  真正的输入变体叫 **`Op::TurnInput`**（765），不是 `UserTurn`。
-- **`EventMsg` 有 serde**（1531–1533：`tag = "type"`, `rename_all = "snake_case"`），可以落盘、可以 `--json` 输出。
+四个条目结构里，`UserMessageItem` 和 `AgentMessageItem` 都带 `id`（给界面做 key），
+`ReasoningItem` 多一个 `raw_content`（`#[serde(default)]`，容忍缺失），
+`CommandExecutionItem` 里有 `status`、`exit_code`、`duration`。
+`CommandExecutionStatus` 是 snake_case 的四个值：`in_progress`、`completed`、`failed`、`declined`
+（`items.rs:208-214`）。
 
-| Rust 变体 | 线格式 `type` | 反序列化额外接受 | 出处 |
-|-----------|---------------|------------------|------|
-| `Error` | `error` | — | 1537 |
-| `TurnStarted` | **`task_started`** | `turn_started` | 1585 |
-| `TurnComplete` | **`task_complete`** | `turn_complete` | 1594 |
-| `AgentMessage` | `agent_message` | — | 1602 |
-| `ExecCommandBegin` | `exec_command_begin` | — | 1650 |
-| `ExecCommandEnd` | `exec_command_end` | — | 1658 |
+## 六、事件能落盘，Op 不能
 
-`task_*` 是 v1 线格式，`turn_*` 只是兼容 alias —— 单看枚举名会写错，这是必须靠读属性才知道的事。
+`EventMsg` 带完整的 serde（`protocol.rs:1531-1533`：`tag="type"`, `rename_all="snake_case"`），
+因为事件要写进 rollout、要通过 `--json` 输出。我们只做六个变体。
 
-事件字段（我们保留的子集）：
+其中两个的名字需要背下来：`TurnStarted` 线上的 `type` 是 **`task_started`**，
+`TurnComplete` 是 **`task_complete`**（`protocol.rs:1585`、`:1594`）。
+注释写得很清楚——v1 线格式用 `task_*`，`turn_*` 只是给新格式留的 alias。
+只读枚举名的人会写错，而且写错之后测试是绿的（因为枚举内部一致），只有和真数据对照才会发现。
 
-| 事件 | 字段 | 备注 |
-|------|------|------|
-| `TurnStartedEvent` | `turn_id: String`, `started_at?: i64`, `model_context_window?: i64` | 上游另有 attribution/trace/`collaboration_mode_kind`（2437–2459） |
-| `TurnCompleteEvent` | `turn_id`, `last_agent_message?`, `error?: ErrorEvent`, `started_at?`, `completed_at?`, `duration_ms?` | 结束独有字段全部 Option |
-| `AgentMessageEvent` | `message: String`, `phase?: MessagePhase` | `MessagePhase = commentary \| partial_answer \| final_answer`（`models.rs:985–995`） |
-| `ExecCommandBeginEvent` | `call_id`, `turn_id`, `started_at_ms: i64`, `command: Vec<String>`, `cwd: PathUri`, `source: ExecCommandSource` | `started_at_ms` 有 `#[serde(default)]` |
-| `ExecCommandEndEvent` | `call_id`, `turn_id`, `completed_at_ms: i64`, `command`, `cwd`, `aggregated_output: String`, `exit_code: i32`, `duration: Duration`, `status: ExecCommandStatus` | `duration` 用 `#[ts(type="string")]`，线格式是字符串 |
-| `ErrorEvent` | `message: String`, `codex_error_info?` | `misalignment` 带 `#[serde(skip)]`（2334）：**双向丢弃**，往返后必为 None |
+事件字段还有一个规律：开始事件和结束事件各带一半信息。`TurnStartedEvent` 有 `started_at`，
+`TurnCompleteEvent` 有 `last_agent_message`、`error`、`completed_at`、`duration_ms`，且全是 Option
+（`protocol.rs:2407-2433`）。`ErrorEvent.misalignment` 则带 `#[serde(skip)]`（2334-2337），
+双向丢弃：编码时消失，解码后是 `None`。
 
-`ExecCommandSource` = `agent | user_shell | unified_exec_startup | unified_exec_interaction`，默认 `agent`（3847–3859）。
+`Op` 完全相反：它只有 `derive_more::Debug` 和 `#[non_exhaustive]`（702-705），一个 serde 都没有。
+原因在字段里——`Op::TurnInput` 带 `reply: oneshot::Sender<CodexResult<..>>`（768），
+这是进程内的应答通道，序列化它没有意义。
 
-## 3. 语义规则
+我们的 M1 里不引 tokio，所以 `Op::TurnInput` 先只保留输入本身，去掉 `reply`。
+这处偏离要写进 `notes/m1.md`：等 M7 需要"提交后得到应答"时再补，那时你才会知道它为什么存在。
 
-**不变量**
-1. `ResponseItem` 的 tag 是 snake_case；`TurnItem` 的 tag 是 PascalCase。两者不可统一。
-2. 三种 ID 在 JSON 里都是字符串；`SessionId`/`ThreadId` 解析失败即错误，`ResponseItemId` 永不因格式报错。
-3. 未知 `ResponseItem` tag → `Other`，不报错；`EventMsg` 未确认有同类兜底（我们**不**加，让它报错，因为事件流坏了应该立刻知道）。
+## 七、先写这十二个测试
 
-**顺序**
-- 一轮：`Op::TurnInput` 进入 → `task_started` → ……（`agent_message` / `exec_command_begin` → `exec_command_end`）→ `task_complete`。
-- `exec_command_begin` / `exec_command_end` 靠 `call_id` 配对，且两端都带 `turn_id`。
-- 顺序在上游是运行时行为（发射点在我们不读的 core 里），**这条来自 M7 的需要，不是从类型推出来的**——写代码时按这个顺序，等 M7 再验证。
+测试是这一章唯一能证明"你看懂了"的东西。名字按行为起，断言具体值。
 
-**错误路径**
-- `ErrorEvent.message` 必填（无 default）；`codex_error_info` 可缺。
-- `TurnCompleteEvent.error` 是"整轮失败"的收口；`EventMsg::Error` 是过程错误。两者同一类型，但**不能假定同一次错误会同时出现在两处**（上游发射逻辑未读）。
-- `misalignment` 双向 skip：`Some` 编码后消失，解码后是 `None`。
+| 测试 | 断言 |
+|------|------|
+| `response_item_message_tag_is_snake_case` | `type` 等于 `"message"` |
+| `turn_item_tag_keeps_pascal_case` | `TurnItem::UserMessage` 的 `type` 是 `"UserMessage"` |
+| `event_turn_started_serializes_as_task_started` | `type` 等于 `"task_started"` |
+| `event_accepts_turn_started_alias` | 输入 `turn_started` 能解，再编码变回 `task_started` |
+| `response_item_unknown_tag_becomes_other` | `{"type":"brand_new"}` 解成 `Other`，不 panic |
+| `content_item_round_trips_input_text` | 往返后 `text` 不变，`type` 仍是 `input_text` |
+| `function_call_arguments_stay_string` | `arguments` 是字符串，不是对象 |
+| `function_call_output_serializes_body_only` | 即使 `success = Some(true)`，JSON 里也没有这个键 |
+| `function_call_output_decode_drops_success` | 解码后 `success` 是 `None`；body 的两种形状都能解 |
+| `session_id_rejects_non_uuid` | `"not-a-uuid"` 解码报错 |
+| `response_item_id_accepts_any_string` | `""`、`"x"`、`"msg_1"` 都能解，编码回原样 |
+| `turn_complete_optional_fields_default_to_none` | 只给 `turn_id` 时其余为 `None`，编码后这些键缺席 |
 
-## 4. 必须写的测试（12 条）
+错误路径包含在里面了：非 UUID 解码、缺必填字段（`ErrorEvent` 少 `message` 报 missing field）、
+body 收到对象而不是字符串/数组。写完这十二条，你的协议层基本就对了。
 
-| 测试名 | 断言什么 |
-|--------|----------|
-| `response_item_message_tag_is_snake_case` | `serde_json::to_value(Message{..})["type"] == "message"` |
-| `turn_item_tag_keeps_pascal_case` | `TurnItem::UserMessage(..)` 的 `type` 是 `"UserMessage"` |
-| `event_turn_started_serializes_as_task_started` | `type == "task_started"` |
-| `event_accepts_turn_started_alias` | 输入 `{"type":"turn_started",...}` 能解成 `TurnStarted`，再编码变回 `task_started` |
-| `response_item_unknown_tag_becomes_other` | `{"type":"brand_new"}` → `ResponseItem::Other`，不 panic |
-| `content_item_round_trips_input_text` | 往返后 `text` 相等，`type` 仍是 `input_text` |
-| `function_call_arguments_stay_string` | `arguments` 是 `"{\"path\":\"a\"}"` 字符串，不是对象 |
-| `function_call_output_serializes_body_only` | 编码结果里没有 `success` 键（即使 `Some(true)`） |
-| `function_call_output_decode_drops_success` | 解码后 `success == None`；且 `body` 两种形状（字符串 / 数组）都能解 |
-| `session_id_rejects_non_uuid` | `"not-a-uuid"` 解码报错，错误信息里含该输入 |
-| `response_item_id_accepts_any_string` | `""`、`"x"`、`"msg_1"` 都能解，且编码回原样 |
-| `turn_complete_optional_fields_default_to_none` | 只给 `turn_id` 时，其余 Option 全 None，且编码后这些键不出现 |
+## 八、七步，每步都能编译
 
-错误路径 4 条已含在上面：非 UUID 解码、未知 `ResponseItem` tag（兜底不算错）、缺必填字段（`ErrorEvent` 少 `message` 报 "missing field"）、
-以及 `FunctionCallOutputBody` 收到对象而不是字符串/数组。
+| 步 | 做什么 | 行数 |
+|----|--------|------|
+| 1 | `ids.rs`：三个 newtype、`Display`、手写 `Serialize` / `Deserialize` | ~110 |
+| 2 | 接上 `uuid` 依赖（已按 R-008 批准），补 `SessionId::new()` | ~20 |
+| 3 | `items.rs`：`ContentItem` 与 `ResponseItem` 的四个变体 + `Other` | ~140 |
+| 4 | `FunctionCallOutputPayload`：手写序列化，只写 body | ~60 |
+| 5 | `turn.rs`：`TurnItem` 与四个条目结构，注意 PascalCase | ~120 |
+| 6 | `event.rs`：`EventMsg` 六个变体 + `task_*` 的 rename 与 alias | ~170 |
+| 7 | `op.rs`：`Op`（不加 serde）与精简的 `TurnInput` | ~60 |
 
-## 5. 手写步骤
+合计约六百八十行，在预算内。第四步值得慢一点：手写 serde 是这一章唯一真正需要查文档的地方，
+写完你会明白"哪些字段在线格式里根本不存在"。
 
-| Step | 做什么 | 大概行数 | 绿了之后 |
-|------|--------|----------|----------|
-| 1 | `ids.rs`：三个 newtype + `Display` + 手写 `Serialize`/`Deserialize`（先不写 `FromStr`） | ~110 | 跑 3 条 ID 测试 |
-| 2 | 加 `uuid` 依赖（需裁决 R-008 先通过），补 `SessionId::new()` | ~20 | — |
-| 3 | `items.rs`：`ContentItem` + `ResponseItem` 四个变体 + `Other` | ~140 | 跑 tag / round-trip 测试 |
-| 4 | `FunctionCallOutputPayload`：手写 `Serialize`（只写 body）+ `Deserialize`（success=None） | ~60 | 跑 body-only 两条测试 |
-| 5 | `turn.rs`：`TurnItem` + 四个条目结构（注意 PascalCase tag） | ~120 | 跑 PascalCase 测试 |
-| 6 | `event.rs`：`EventMsg` + 六个事件 + `task_*` rename/alias | ~170 | 跑事件 tag 测试 |
-| 7 | `op.rs`：`Op`（无 serde）+ `TurnInputRequest` 精简版 | ~60 | `./x.sh` 全绿 |
+## 九、三个坑
 
-合计 ~680 行，落在 M1 预算（600–900）内。
+第一个坑是那个看不见的 `rename_all`。`TurnItem` 没有它，tag 就是变体名。写完先跑那条 PascalCase 测试，
+不要凭直觉统一成 snake_case。
 
-Step 7 的一个主动简化：上游的 `Op::TurnInput` 带 `reply: oneshot::Sender<..>`（768），
-我们的 M1 不引 tokio，所以写成 `Op::TurnInput { input: TurnInput }`，**并在 `notes/m1.md` 里记下这处偏离**。
-等到 M7 需要应答时再补 reply——那时你才知道它为什么存在。
+第二个坑是 `task_started`。它是上游为了兼容 v1 线格式留下的名字，`turn_started` 只是输入侧的别名。
+测试要同时覆盖"编码出来是 task_started"和"能读进 turn_started"两个方向。
 
-## 6. 三个常见误解
+第三个坑是"结构体字段都会进 JSON"。`FunctionCallOutputPayload` 没有派生 serde，`success` 永远不上线；
+`ErrorEvent.misalignment` 被双向跳过。这两处是上游刻意的不对称，不是遗漏。
 
-1. **「所有 tag 都转 snake_case」** → `TurnItem` 没 `rename_all`，tag 是 `UserMessage`。`items.rs:47–51`
-2. **「事件名就是 type 值」** → `TurnStarted` 输出 `task_started`，`turn_started` 只是输入 alias。`protocol.rs:1585、1594`
-3. **「结构体字段都会进 JSON」** → `FunctionCallOutputPayload` 根本没派生 serde，只有 `body` 上线，`success` 是内部字段；`ErrorEvent.misalignment` 被双向 skip。`models.rs:2368–2372`、`protocol.rs:2334–2337`
+## 十、做完给我看什么
 
-## 7. 验收问题（答不出不算过）
+跑一次 `./x.sh`，把末尾输出贴出来；把 `notes/m1.md` 里的三行笔记（这一段在链路里的位置、
+它的输入输出、最容易误解的一点）发我；然后回答下面五个问题。
+
+我会挑两条测试读断言，再随机抽一条行为回上游源码核对。都过了，就把 R1 标记为完成，开始写 R2 的路书。
+
+## 十一、验收问题
 
 1. 为什么 `Op` 不能序列化？如果硬要序列化，哪个字段先炸？
 2. `ResponseItem` 和 `TurnItem` 描述的是同一件事吗？各自给谁看？
-3. `FunctionCallOutputPayload` 为什么不能直接 `derive(Serialize)`？手写时你要丢掉什么？
-4. `task_started` 这个字符串从哪来？如果只读枚举名会写成什么？
-5. `SessionId` 与 `ThreadId` 能不能合并成一个类型？合并会丢什么信息？
+3. `FunctionCallOutputPayload` 为什么不能直接 `derive(Serialize)`？手写时你丢掉了什么？
+4. `task_started` 这个字符串从哪来？只读枚举名会写成什么？
+5. `SessionId` 和 `ThreadId` 能不能合并成一个类型？合并会丢什么信息？
